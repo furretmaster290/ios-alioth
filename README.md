@@ -1,3 +1,9 @@
+VERY EARLY WIP. THE README IS CURRENTLY UNEDITED.
+
+
+
+
+
 # ios-sm8250
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro and a Xiaomi Mi 10.**
