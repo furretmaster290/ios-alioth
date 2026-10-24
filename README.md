@@ -1,4 +1,4 @@
-VERY EARLY WIP. THE README IS CURRENTLY UNEDITED.
+VERY EARLY WIP.
 
 
 
@@ -6,14 +6,20 @@ VERY EARLY WIP. THE README IS CURRENTLY UNEDITED.
 
 # ios-sm8250
 
-**Apple's iOS 16 running on a Redmi Note 10 Pro and a Xiaomi Mi 10.**
+**Apple's iOS 16 running on a Redmi Note 10 Pro, POCO F3 and a Xiaomi Mi 10.**
 
 This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to Qualcomm SM7150 and SM8250 phones. On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
+
+Current state of alioth: Booting to the iOS 16 Lockscreen.
+Next step: get touch working. Hopefully will get GPU acceleration afterwards.
+
+The rest of this README remains largely unedited.
 
 | Board | Phone | SoC | State |
 | --- | --- | --- | --- |
 | `sweet` | Redmi Note 10 Pro | SM7150 / Snapdragon 732G | Boots to the iOS home screen; touch, buttons and display work |
 | `umi` | Xiaomi Mi 10 | SM8250 / Snapdragon 865 | Bring-up port: kernel patch, Apple device tree and shim build; **not yet tested on hardware** |
+|
 
 The `sweet` result below is from **2026-10-18**: the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver. The Mi 10 port uses the same kernel and userland but has not booted on a phone yet.
 
