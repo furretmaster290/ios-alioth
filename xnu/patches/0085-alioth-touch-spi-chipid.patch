@@ -1,0 +1,307 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1457,7 +1457,7 @@
+ 	touch_wr(base, off, cfg);
+ }
+ 
+-static void
++static vm_offset_t
+ ts4_phase_b(vm_offset_t gcc)
+ {
+ 	uint32_t vote = touch_rd(gcc, TS4_GCC_VOTE);
+@@ -1476,7 +1476,7 @@
+ 	}
+ 	if (dfs & 1u) {
+ 		printf("SWEET TOUCH4: B: DFS still on; stopping\n");
+-		return;
++		return 0;
+ 	}
+ 	/* XO parent 0, HID divider 1 => 19.2 MHz. */
+ 	cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
+@@ -1484,21 +1484,21 @@
+ 	touch_wr(gcc, TS4_RCG, touch_rd(gcc, TS4_RCG) | 1u);
+ 	if (!touch_wait_clear(gcc, TS4_RCG, 1u)) {
+ 		printf("SWEET TOUCH4: B: RCG update timeout\n");
+-		return;
++		return 0;
+ 	}
+ 	const uint32_t halts[] = {0x17004, 0x17008, 0x23000, 0x23008, TS4_RCG_HALT};
+ 	for (unsigned i = 0; i < sizeof(halts) / sizeof(halts[0]); ++i) {
+ 		if (!touch_wait_clear(gcc, halts[i], 1u << 31)) {
+ 			printf("SWEET TOUCH4: B: GCC branch %#x halted (%#x); not touching SE4\n",
+ 			    halts[i], touch_rd(gcc, halts[i]));
+-			return;
++			return 0;
+ 		}
+ 	}
+ 	printf("SWEET TOUCH4: B: clocks ready; reading SE4 registers\n");
+ 	vm_offset_t se = ml_io_map(TS4_SE_PA, 0x4000);
+ 	if (!se) {
+ 		printf("SWEET TOUCH4: B: SE4 mapping failed\n");
+-		return;
++		return 0;
+ 	}
+ 	uint32_t fw = touch_rd(se, 0x68);
+ 	printf("SWEET TOUCH4: B: SE4 status=%#x clk_ctrl=%#x if_disable=%#x fw=%#x proto=%u\n",
+@@ -1509,6 +1509,230 @@
+ 	    touch_rd(se, 0xe28));
+ 	printf("SWEET TOUCH4: B: SE4 is %s (proto 1 = SPI, 2 = UART, 3 = I2C)\n",
+ 	    ((fw >> 8) & 0xffu) == 1u ? "SPI firmware, as the DT expects" : "NOT loaded as SPI");
++	return se;
++}
++
++/*
++ * ALIOTH step 2 (boot-arg sweettouchspi=1, implies sweettouchse=1): a polled
++ * GENI SPI master in FIFO mode on SE4 and a FocalTech register read.
++ * Register sequence follows the Linux spi-geni-qcom driver; framing follows
++ * the vendor focaltech_spi driver (cmd, 0xA0, len, 3 dummy, data, CRC16).
++ */
++#define TS4_GENI_FORCE_DEFAULT 0x20u
++#define TS4_GENI_OUTPUT_CTRL   0x24u
++#define TS4_GENI_CGC_CTRL      0x28u
++#define TS4_GENI_CLK_SEL       0x7cu
++#define TS4_GENI_SER_M_CLK_CFG 0x48u
++#define TS4_SPI_CPHA           0x224u
++#define TS4_SPI_LOOPBACK       0x22cu
++#define TS4_SPI_CPOL           0x230u
++#define TS4_SPI_DEMUX_INV      0x24cu
++#define TS4_SPI_DEMUX_SEL      0x250u
++#define TS4_GENI_BYTE_GRAN     0x254u
++#define TS4_GENI_DMA_MODE_EN   0x258u
++#define TS4_SPI_TRANS_CFG      0x25cu
++#define TS4_GENI_TX_PACK0      0x260u
++#define TS4_GENI_TX_PACK1      0x264u
++#define TS4_SPI_WORD_LEN       0x268u
++#define TS4_SPI_TX_LEN         0x26cu
++#define TS4_SPI_RX_LEN         0x270u
++#define TS4_SPI_DELAYS         0x278u
++#define TS4_GENI_RX_PACK0      0x284u
++#define TS4_GENI_RX_PACK1      0x288u
++#define TS4_M_CMD0             0x600u
++#define TS4_M_CMD_CTRL         0x604u
++#define TS4_M_IRQ_STATUS       0x610u
++#define TS4_M_IRQ_EN           0x614u
++#define TS4_M_IRQ_CLEAR        0x618u
++#define TS4_TX_FIFO            0x700u
++#define TS4_RX_FIFO            0x780u
++#define TS4_RX_FIFO_STATUS     0x804u
++#define TS4_TX_WATERMARK       0x80cu
++#define TS4_RX_WATERMARK       0x810u
++#define TS4_RX_RFR_WATERMARK   0x814u
++#define TS4_GSI_EVENT_EN       0xe18u
++#define TS4_SE_IRQ_EN          0xe1cu
++#define TS4_DMA_GENERAL_CFG    0xe30u
++#define TS4_M_DONE             (1u << 0)
++#define TS4_M_ERRORS           (0x3eu | (1u << 24) | (1u << 25) | (1u << 28) | (1u << 29))
++#define TS4_SPI_DIV            4u /* 19.2 MHz / 4 = 4.8 MHz, mode 0, 8-bit */
++#define TS4_FTS_MAX_DATA       16u
++
++static void
++ts4_spi_init(vm_offset_t se)
++{
++	touch_wr(se, TS4_GENI_CGC_CTRL, touch_rd(se, TS4_GENI_CGC_CTRL) | 0x7fu);
++	touch_wr(se, TS4_DMA_GENERAL_CFG, touch_rd(se, TS4_DMA_GENERAL_CFG) | 0xfu);
++	touch_wr(se, TS4_GENI_OUTPUT_CTRL, 0x7fu);
++	touch_wr(se, TS4_GENI_FORCE_DEFAULT, 1u);
++	touch_wr(se, TS4_SE_IRQ_EN, touch_rd(se, TS4_SE_IRQ_EN) | 0xfu);
++	touch_wr(se, TS4_GENI_DMA_MODE_EN, touch_rd(se, TS4_GENI_DMA_MODE_EN) & ~1u);
++	touch_wr(se, TS4_GSI_EVENT_EN, 0u);
++	touch_wr(se, TS4_RX_WATERMARK, 0u);
++	touch_wr(se, TS4_RX_RFR_WATERMARK, 0u);
++	touch_wr(se, TS4_TX_WATERMARK, 0u);
++	/* 4 x 8-bit words per FIFO entry, MSB first */
++	touch_wr(se, TS4_GENI_TX_PACK0, 0x0007f8feu);
++	touch_wr(se, TS4_GENI_TX_PACK1, 0x000ffefeu);
++	touch_wr(se, TS4_GENI_RX_PACK0, 0x0007f8feu);
++	touch_wr(se, TS4_GENI_RX_PACK1, 0x000ffefeu);
++	touch_wr(se, TS4_GENI_BYTE_GRAN, 0u);
++	touch_wr(se, TS4_SPI_WORD_LEN, (touch_rd(se, TS4_SPI_WORD_LEN) & ~0x3ffu) | (8u - 4u));
++	/* SPI mode 0, chip select 0, no loopback, no inter-word delays */
++	touch_wr(se, TS4_SPI_LOOPBACK, touch_rd(se, TS4_SPI_LOOPBACK) & ~3u);
++	touch_wr(se, TS4_SPI_DEMUX_SEL, 0u);
++	touch_wr(se, TS4_SPI_CPHA, touch_rd(se, TS4_SPI_CPHA) & ~1u);
++	touch_wr(se, TS4_SPI_CPOL, touch_rd(se, TS4_SPI_CPOL) & ~4u);
++	touch_wr(se, TS4_SPI_DEMUX_INV, 0u);
++	touch_wr(se, TS4_SPI_DELAYS, 0u);
++	touch_wr(se, TS4_GENI_CLK_SEL, 0u);
++	touch_wr(se, TS4_GENI_SER_M_CLK_CFG, (TS4_SPI_DIV << 4) | 1u);
++	touch_wr(se, TS4_M_IRQ_EN, TS4_M_DONE | TS4_M_ERRORS | (1u << 26) | (1u << 27) | (1u << 30));
++	printf("SWEET TOUCH4: C: SPI init: word_len=%#x cfg=%#x clk=%#x tx_pack=%#x/%#x\n",
++	    touch_rd(se, TS4_SPI_WORD_LEN), touch_rd(se, TS4_SPI_TRANS_CFG),
++	    touch_rd(se, TS4_GENI_SER_M_CLK_CFG), touch_rd(se, TS4_GENI_TX_PACK0),
++	    touch_rd(se, TS4_GENI_TX_PACK1));
++}
++
++static void
++ts4_spi_flush_rx(vm_offset_t se)
++{
++	unsigned wc = touch_rd(se, TS4_RX_FIFO_STATUS) & 0x1ffffffu;
++	while (wc-- && wc < 64u) {
++		(void)touch_rd(se, TS4_RX_FIFO);
++	}
++}
++
++/* One full-duplex transfer of len bytes (len <= 60, one FIFO fill). */
++static int
++ts4_spi_xfer(vm_offset_t se, const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	uint32_t irq = 0;
++	unsigned t;
++	if (len == 0 || len > 60u) {
++		return EINVAL;
++	}
++	touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
++	touch_wr(se, TS4_SPI_TRANS_CFG, touch_rd(se, TS4_SPI_TRANS_CFG) & ~1u);
++	touch_wr(se, TS4_SPI_TX_LEN, len);
++	touch_wr(se, TS4_SPI_RX_LEN, len);
++	touch_wr(se, TS4_M_CMD0, 3u << 27); /* SPI_FULL_DUPLEX, CS asserted for the command */
++	for (unsigned i = 0; i < len; i += 4u) {
++		uint32_t w = 0;
++		for (unsigned j = 0; j < 4u && i + j < len; ++j) {
++			w |= (uint32_t)tx[i + j] << (8u * j);
++		}
++		touch_wr(se, TS4_TX_FIFO, w);
++	}
++	for (t = 0; t < 20000u; ++t) { /* ~100 ms */
++		irq = touch_rd(se, TS4_M_IRQ_STATUS);
++		if (irq & (TS4_M_DONE | TS4_M_ERRORS)) {
++			break;
++		}
++		delay(5);
++	}
++	if (!(irq & TS4_M_DONE) || (irq & TS4_M_ERRORS)) {
++		printf("SWEET TOUCH4: C: xfer failed irq=%#x status=%#x tx_fifo=%#x rx_fifo=%#x after %u polls\n",
++		    irq, touch_rd(se, 0x40), touch_rd(se, 0x800), touch_rd(se, TS4_RX_FIFO_STATUS), t);
++		touch_wr(se, TS4_M_CMD_CTRL, 1u << 2); /* cancel */
++		for (t = 0; t < 2000u; ++t) {
++			if (touch_rd(se, TS4_M_IRQ_STATUS) & ((1u << 4) | (1u << 5) | TS4_M_DONE)) {
++				break;
++			}
++			delay(5);
++		}
++		if (!(touch_rd(se, TS4_M_IRQ_STATUS) & ((1u << 4) | TS4_M_DONE))) {
++			touch_wr(se, TS4_M_CMD_CTRL, 1u << 1); /* abort */
++			delay(1000);
++		}
++		ts4_spi_flush_rx(se);
++		touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
++		return EIO;
++	}
++	unsigned wc = touch_rd(se, TS4_RX_FIFO_STATUS) & 0x1ffffffu;
++	for (unsigned i = 0; i < wc && i * 4u < len && i < 16u; ++i) {
++		uint32_t w = touch_rd(se, TS4_RX_FIFO);
++		for (unsigned j = 0; j < 4u && i * 4u + j < len; ++j) {
++			rx[i * 4u + j] = (uint8_t)(w >> (8u * j));
++		}
++	}
++	touch_wr(se, TS4_M_IRQ_CLEAR, irq);
++	ts4_spi_flush_rx(se);
++	return 0;
++}
++
++static uint16_t
++ts4_crc_kermit(const uint8_t *d, unsigned n)
++{
++	uint16_t crc = 0xffffu;
++	for (unsigned i = 0; i < n; ++i) {
++		crc ^= d[i];
++		for (unsigned j = 0; j < 8u; ++j) {
++			crc = (crc & 1u) ? (uint16_t)((crc >> 1) ^ 0x8408u) : (uint16_t)(crc >> 1);
++		}
++	}
++	return crc;
++}
++
++/* FocalTech register read: returns 0 ok, else a negative-ish code. */
++static int
++ts4_fts_read(vm_offset_t se, uint8_t reg, uint8_t *out, unsigned len, uint8_t raw[16])
++{
++	uint8_t tx[4 + 3 + TS4_FTS_MAX_DATA + 2];
++	uint8_t rx[sizeof(tx)];
++	unsigned total = 4u + 3u + len + 2u;
++	int ret = EIO;
++	if (len == 0 || len > TS4_FTS_MAX_DATA) {
++		return EINVAL;
++	}
++	for (int attempt = 0; attempt < 3; ++attempt) {
++		memset(tx, 0, sizeof(tx));
++		memset(rx, 0, sizeof(rx));
++		tx[0] = reg;
++		tx[1] = 0xa0; /* read with CRC */
++		tx[2] = (uint8_t)(len >> 8);
++		tx[3] = (uint8_t)len;
++		if (ts4_spi_xfer(se, tx, rx, total) != 0) {
++			ret = EIO;
++			delay(150);
++			continue;
++		}
++		for (unsigned i = 0; i < 16u && i < total; ++i) {
++			raw[i] = rx[i];
++		}
++		if (rx[3] & 0xa0u) {
++			ret = ENXIO; /* controller reports busy/error */
++			delay(150);
++			continue;
++		}
++		uint16_t want = (uint16_t)(rx[7 + len] | (rx[7 + len + 1] << 8));
++		if (ts4_crc_kermit(&rx[7], len) != want) {
++			ret = 74;
++			delay(150);
++			continue;
++		}
++		memcpy(out, &rx[7], len);
++		return 0;
++	}
++	return ret;
++}
++
++static void
++ts4_spi_probe(vm_offset_t se)
++{
++	static const uint8_t regs[] = {0xa3, 0x9f, 0xa6, 0xa8};
++	printf("SWEET TOUCH4: C: SPI probe starting (4.8 MHz, mode 0)\n");
++	ts4_spi_init(se);
++	touch_wait(10);
++	for (unsigned r = 0; r < sizeof(regs); ++r) {
++		uint8_t v = 0xee;
++		uint8_t raw[16];
++		memset(raw, 0xee, sizeof(raw));
++		int rc = ts4_fts_read(se, regs[r], &v, 1, raw);
++		printf("SWEET TOUCH4: C: reg %#x -> rc=%d val=%#x raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    regs[r], rc, v, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9]);
++	}
++	printf("SWEET TOUCH4: C: SPI probe done\n");
+ }
+ 
+ static void
+@@ -1516,10 +1740,15 @@
+ {
+ 	unsigned delay_s = 45;
+ 	int phase_b = 0;
++	int spi_probe = 0;
+ 	(void)arg;
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("sweettouchse", &phase_b, sizeof(phase_b));
++	(void)PE_parse_boot_argn("sweettouchspi", &spi_probe, sizeof(spi_probe));
++	if (spi_probe) {
++		phase_b = 1;
++	}
+ 	printf("SWEET TOUCH4: alioth FocalTech SPI diagnostic starting in %u s (phase B %s)\n",
+ 	    delay_s, phase_b ? "on" : "off");
+ 	touch_wait(delay_s * 1000u);
+@@ -1574,7 +1803,12 @@
+ 	if (phase_b) {
+ 		vm_offset_t gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+ 		if (gcc) {
+-			ts4_phase_b(gcc);
++			vm_offset_t se4 = ts4_phase_b(gcc);
++			if (se4 && spi_probe) {
++				ts4_spi_probe(se4);
++			} else if (spi_probe) {
++				printf("SWEET TOUCH4: C: skipped (SE4 clocks not ready)\n");
++			}
+ 		} else {
+ 			printf("SWEET TOUCH4: B: GCC mapping failed\n");
+ 		}
