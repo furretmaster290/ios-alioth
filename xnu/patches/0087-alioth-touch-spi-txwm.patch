@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1565,7 +1565,8 @@
+ 	touch_wr(se, TS4_DMA_GENERAL_CFG, touch_rd(se, TS4_DMA_GENERAL_CFG) | 0xfu);
+ 	touch_wr(se, TS4_GENI_OUTPUT_CTRL, 0x7fu);
+ 	touch_wr(se, TS4_GENI_FORCE_DEFAULT, 1u);
+-	touch_wr(se, TS4_SE_IRQ_EN, touch_rd(se, TS4_SE_IRQ_EN) | 0xfu);
++	touch_wr(se, TS4_SE_IRQ_EN, 0u); /* like the I2C engine: poll local M_IRQ_STATUS */
++	touch_wr(se, 0x644u, 0u);        /* S_IRQ_EN */
+ 	touch_wr(se, TS4_GENI_DMA_MODE_EN, touch_rd(se, TS4_GENI_DMA_MODE_EN) & ~1u);
+ 	touch_wr(se, TS4_GSI_EVENT_EN, 0u);
+ 	touch_wr(se, TS4_RX_WATERMARK, 0u);
+@@ -1641,26 +1642,34 @@
+ 	}
+ 	touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
+ 	touch_wr(se, TS4_SPI_TRANS_CFG, touch_rd(se, TS4_SPI_TRANS_CFG) & ~1u);
++	/* Linux/I2C flow: arm the TX watermark first, write the FIFO only after
++	 * the engine raises TX_WM, then drop the watermark. */
++	touch_wr(se, TS4_TX_WATERMARK, 1u);
+ 	touch_wr(se, TS4_SPI_TX_LEN, len);
+ 	touch_wr(se, TS4_SPI_RX_LEN, len);
+ 	touch_wr(se, TS4_M_CMD0, 3u << 27); /* SPI_FULL_DUPLEX, CS asserted for the command */
+-	for (unsigned i = 0; i < len; i += 4u) {
+-		uint32_t w = 0;
+-		for (unsigned j = 0; j < 4u && i + j < len; ++j) {
+-			w |= (uint32_t)tx[i + j] << (8u * j);
+-		}
+-		touch_wr(se, TS4_TX_FIFO, w);
+-	}
++	bool sent = false;
+ 	for (t = 0; t < 20000u; ++t) { /* ~100 ms */
+ 		irq = touch_rd(se, TS4_M_IRQ_STATUS);
++		if (!sent && (irq & (1u << 30))) {
++			for (unsigned i = 0; i < len; i += 4u) {
++				uint32_t w = 0;
++				for (unsigned j = 0; j < 4u && i + j < len; ++j) {
++					w |= (uint32_t)tx[i + j] << (8u * j);
++				}
++				touch_wr(se, TS4_TX_FIFO, w);
++			}
++			touch_wr(se, TS4_TX_WATERMARK, 0u);
++			sent = true;
++		}
+ 		if (irq & (TS4_M_DONE | TS4_M_ERRORS)) {
+ 			break;
+ 		}
+ 		delay(5);
+ 	}
+ 	if (!(irq & TS4_M_DONE) || (irq & TS4_M_ERRORS)) {
+-		printf("SWEET TOUCH4: C: xfer failed irq=%#x status=%#x tx_fifo=%#x rx_fifo=%#x after %u polls\n",
+-		    irq, touch_rd(se, 0x40), touch_rd(se, 0x800), touch_rd(se, TS4_RX_FIFO_STATUS), t);
++		printf("SWEET TOUCH4: C: xfer failed irq=%#x status=%#x tx_fifo=%#x rx_fifo=%#x after %u polls (tx_wm_seen=%d)\n",
++		    irq, touch_rd(se, 0x40), touch_rd(se, 0x800), touch_rd(se, TS4_RX_FIFO_STATUS), t, sent ? 1 : 0);
+ 		printf("SWEET TOUCH4: C: dbg: ios=%#x clk_ctrl=%#x cmd0=%#x seq_start=%#x tx_len=%#x rx_len=%#x\n",
+ 		    touch_rd(se, 0x908), touch_rd(se, 0x60), touch_rd(se, TS4_M_CMD0),
+ 		    touch_rd(se, 0x84), touch_rd(se, TS4_SPI_TX_LEN), touch_rd(se, TS4_SPI_RX_LEN));
