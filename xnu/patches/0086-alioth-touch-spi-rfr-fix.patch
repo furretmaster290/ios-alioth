@@ -1,0 +1,84 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1569,7 +1569,8 @@
+ 	touch_wr(se, TS4_GENI_DMA_MODE_EN, touch_rd(se, TS4_GENI_DMA_MODE_EN) & ~1u);
+ 	touch_wr(se, TS4_GSI_EVENT_EN, 0u);
+ 	touch_wr(se, TS4_RX_WATERMARK, 0u);
+-	touch_wr(se, TS4_RX_RFR_WATERMARK, 0u);
++	/* Linux: geni_se_init(base, 0, tx_fifo_depth - 2); 0 here stalls full-duplex */
++	touch_wr(se, TS4_RX_RFR_WATERMARK, 14u);
+ 	touch_wr(se, TS4_TX_WATERMARK, 0u);
+ 	/* 4 x 8-bit words per FIFO entry, MSB first */
+ 	touch_wr(se, TS4_GENI_TX_PACK0, 0x0007f8feu);
+@@ -1588,6 +1589,8 @@
+ 	touch_wr(se, TS4_GENI_CLK_SEL, 0u);
+ 	touch_wr(se, TS4_GENI_SER_M_CLK_CFG, (TS4_SPI_DIV << 4) | 1u);
+ 	touch_wr(se, TS4_M_IRQ_EN, TS4_M_DONE | TS4_M_ERRORS | (1u << 26) | (1u << 27) | (1u << 30));
++	printf("SWEET TOUCH4: C: SPI init: rx_wm=%#x rfr_wm=%#x status=%#x\n",
++	    touch_rd(se, TS4_RX_WATERMARK), touch_rd(se, TS4_RX_RFR_WATERMARK), touch_rd(se, 0x40));
+ 	printf("SWEET TOUCH4: C: SPI init: word_len=%#x cfg=%#x clk=%#x tx_pack=%#x/%#x\n",
+ 	    touch_rd(se, TS4_SPI_WORD_LEN), touch_rd(se, TS4_SPI_TRANS_CFG),
+ 	    touch_rd(se, TS4_GENI_SER_M_CLK_CFG), touch_rd(se, TS4_GENI_TX_PACK0),
+@@ -1603,6 +1606,27 @@
+ 	}
+ }
+ 
++/* Cancel (then abort) an active master command and drain the FIFOs. */
++static void
++ts4_spi_recover(vm_offset_t se)
++{
++	unsigned t;
++	touch_wr(se, TS4_M_CMD_CTRL, 1u << 2); /* cancel */
++	for (t = 0; t < 4000u && (touch_rd(se, 0x40) & 1u); ++t) {
++		delay(5);
++	}
++	if (touch_rd(se, 0x40) & 1u) {
++		touch_wr(se, TS4_M_CMD_CTRL, 1u << 1); /* abort */
++		for (t = 0; t < 4000u && (touch_rd(se, 0x40) & 1u); ++t) {
++			delay(5);
++		}
++	}
++	ts4_spi_flush_rx(se);
++	touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
++	printf("SWEET TOUCH4: C: recover: status=%#x tx_fifo=%#x irq=%#x\n",
++	    touch_rd(se, 0x40), touch_rd(se, 0x800), touch_rd(se, TS4_M_IRQ_STATUS));
++}
++
+ /* One full-duplex transfer of len bytes (len <= 60, one FIFO fill). */
+ static int
+ ts4_spi_xfer(vm_offset_t se, const uint8_t *tx, uint8_t *rx, unsigned len)
+@@ -1612,6 +1636,9 @@
+ 	if (len == 0 || len > 60u) {
+ 		return EINVAL;
+ 	}
++	if (touch_rd(se, 0x40) & 1u) {
++		ts4_spi_recover(se);
++	}
+ 	touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
+ 	touch_wr(se, TS4_SPI_TRANS_CFG, touch_rd(se, TS4_SPI_TRANS_CFG) & ~1u);
+ 	touch_wr(se, TS4_SPI_TX_LEN, len);
+@@ -1634,19 +1661,10 @@
+ 	if (!(irq & TS4_M_DONE) || (irq & TS4_M_ERRORS)) {
+ 		printf("SWEET TOUCH4: C: xfer failed irq=%#x status=%#x tx_fifo=%#x rx_fifo=%#x after %u polls\n",
+ 		    irq, touch_rd(se, 0x40), touch_rd(se, 0x800), touch_rd(se, TS4_RX_FIFO_STATUS), t);
+-		touch_wr(se, TS4_M_CMD_CTRL, 1u << 2); /* cancel */
+-		for (t = 0; t < 2000u; ++t) {
+-			if (touch_rd(se, TS4_M_IRQ_STATUS) & ((1u << 4) | (1u << 5) | TS4_M_DONE)) {
+-				break;
+-			}
+-			delay(5);
+-		}
+-		if (!(touch_rd(se, TS4_M_IRQ_STATUS) & ((1u << 4) | TS4_M_DONE))) {
+-			touch_wr(se, TS4_M_CMD_CTRL, 1u << 1); /* abort */
+-			delay(1000);
+-		}
+-		ts4_spi_flush_rx(se);
+-		touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
++		printf("SWEET TOUCH4: C: dbg: ios=%#x clk_ctrl=%#x cmd0=%#x seq_start=%#x tx_len=%#x rx_len=%#x\n",
++		    touch_rd(se, 0x908), touch_rd(se, 0x60), touch_rd(se, TS4_M_CMD0),
++		    touch_rd(se, 0x84), touch_rd(se, TS4_SPI_TX_LEN), touch_rd(se, TS4_SPI_RX_LEN));
++		ts4_spi_recover(se);
+ 		return EIO;
+ 	}
+ 	unsigned wc = touch_rd(se, TS4_RX_FIFO_STATUS) & 0x1ffffffu;
