@@ -1,0 +1,221 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -44,6 +44,7 @@
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -159,7 +160,7 @@
+ }
+ 
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup(const char *res, uint32_t *address, unsigned want)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -186,9 +187,11 @@
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if (slave != want || (addr >> 16) != want ||
++			    (addr & (want == RH_VRM ? 15u : 3u)) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid %s entry for %s (slave=%u addr=%#x)\n",
++				    want == RH_VRM ? "VRM" : "BCM", res, slave, addr);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -219,7 +222,7 @@
+ }
+ 
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send(uint32_t address, unsigned n, const uint32_t *offsets, const uint32_t *values)
+ {
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+@@ -267,10 +270,9 @@
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+ 	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	printf("SWEET RPMH: TCS%u ACTIVE %u cmd(s) addr=%#x first-data=%#x irq-enable=%#x\n",
++	    t, n, address, values[0], irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+ 		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+@@ -278,7 +280,7 @@
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, (1u << n) - 1u) || !rh_sync(b + RH_ENABLE, (1u << n) - 1u) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+@@ -289,7 +291,7 @@
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -320,7 +322,7 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: ACTIVE vote complete at %u mV (addr %#x)\n", mv, address);
++	printf("SWEET RPMH: ACTIVE vote complete (addr %#x data %#x)\n", address, values[0]);
+ 	return 0;
+ }
+ 
+@@ -349,10 +351,13 @@
+ 	}
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, &address, RH_VRM);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++		const uint32_t offsets[3] = {0, 8, 4};
++		const uint32_t values[3] = {mv, 7, 1};
++		error = rh_send(address, 3, offsets, values);
+ 	}
+ out:
+ 	if (error) {
+@@ -364,3 +369,44 @@
+ 	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
++
++/*
++ * Vote an RPMh BCM (bus clock manager) resource.  Only the QUP core BCM is
++ * allowed: Linux/downstream votes it whenever a QUP serial engine is used, and
++ * the bootloader only votes what it uses itself.  Command format follows
++ * BCM_TCS_CMD(commit, valid, vote_x, vote_y).
++ */
++int
++sweet_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y)
++{
++	if (!res || strcmp(res, "QUP0") || vote_x > 0x3fffu || vote_y > 0x3fffu) {
++		printf("SWEET RPMH: bcm vote refused (only QUP0, 14-bit votes)\n");
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, &address, RH_BCM);
++	}
++	if (!error) {
++		const uint32_t offsets[1] = {0};
++		const uint32_t values[1] = {(1u << 30) | (1u << 29) | (vote_x << 14) | vote_y};
++		error = rh_send(address, 1, offsets, values);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: bcm vote %s failed errno=%d\n", res, error);
++	} else {
++		printf("SWEET RPMH: bcm %s voted x=%u y=%u\n", res, vote_x, vote_y);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -25,6 +25,7 @@
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern int sweet_rpmh_bcm_vote(const char *res, unsigned vote_x, unsigned vote_y);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+@@ -1786,6 +1787,19 @@
+ 	return ret;
+ }
+ 
++/* True once the master command is no longer active (or DONE is raised). */
++static bool
++ts4_wait_idle(vm_offset_t se, unsigned polls)
++{
++	for (unsigned t = 0; t < polls; ++t) {
++		if ((touch_rd(se, TS4_M_IRQ_STATUS) & TS4_M_DONE) || !(touch_rd(se, 0x40) & 1u)) {
++			return true;
++		}
++		delay(5);
++	}
++	return false;
++}
++
+ static void
+ ts4_spi_probe(vm_offset_t se)
+ {
+@@ -1799,6 +1813,44 @@
+ 		printf("SWEET TOUCH4: C: internal loopback ON (rx should equal tx)\n");
+ 	}
+ 	touch_wait(10);
++	/*
++	 * Unstick ladder: start a data-less command; while it is stalled, apply
++	 * one remedy at a time and see which one lets it finish.
++	 */
++	touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
++	touch_wr(se, TS4_M_CMD0, 8u << 27); /* CS_ASSERT */
++	if (!ts4_wait_idle(se, 2000)) {
++		printf("SWEET TOUCH4: C: first command stalled (status=%#x); trying remedies\n", touch_rd(se, 0x40));
++		int rc;
++		rc = sweet_rpmh_bcm_vote("QUP0", 5000, 2500);
++		printf("SWEET TOUCH4: C: remedy R1 QUP0 bandwidth vote rc=%d -> %s\n", rc,
++		    ts4_wait_idle(se, 600) ? "UNSTUCK" : "still stuck");
++		if (touch_rd(se, 0x40) & 1u) {
++			touch_wr(se, 0x84, 1u); /* SE_GENI_CFG_SEQ_START */
++			printf("SWEET TOUCH4: C: remedy R2 SEQ_START -> %s\n", ts4_wait_idle(se, 600) ? "UNSTUCK" : "still stuck");
++		}
++		if (touch_rd(se, 0x40) & 1u) {
++			touch_wr(se, TS4_GENI_SER_M_CLK_CFG, 0u);
++			delay(100);
++			touch_wr(se, TS4_GENI_SER_M_CLK_CFG, (TS4_SPI_DIV << 4) | 1u);
++			printf("SWEET TOUCH4: C: remedy R3 serial clock re-enable -> %s\n", ts4_wait_idle(se, 600) ? "UNSTUCK" : "still stuck");
++		}
++		if (touch_rd(se, 0x40) & 1u) {
++			touch_wr(se, TS4_SE_IRQ_EN, 0xfu);
++			printf("SWEET TOUCH4: C: remedy R4 SE_IRQ_EN=0xf -> %s\n", ts4_wait_idle(se, 600) ? "UNSTUCK" : "still stuck");
++		}
++		if (touch_rd(se, 0x40) & 1u) {
++			touch_wr(se, TS4_GENI_FORCE_DEFAULT, 1u);
++			printf("SWEET TOUCH4: C: remedy R5 FORCE_DEFAULT -> %s\n", ts4_wait_idle(se, 600) ? "UNSTUCK" : "still stuck");
++		}
++		if (touch_rd(se, 0x40) & 1u) {
++			printf("SWEET TOUCH4: C: no remedy worked; status=%#x\n", touch_rd(se, 0x40));
++			return;
++		}
++	} else {
++		printf("SWEET TOUCH4: C: first command completed without remedies\n");
++	}
++	touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
+ 	/* Staged self-test, simplest first; stop at the first failure. */
+ 	if (ts4_spi_simple(se, 8u, "CS_ASSERT") != 0 || ts4_spi_simple(se, 9u, "CS_DEASSERT") != 0) {
+ 		printf("SWEET TOUCH4: C: engine does not run even a data-less command\n");
