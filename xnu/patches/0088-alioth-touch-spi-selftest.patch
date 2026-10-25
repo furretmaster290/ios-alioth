@@ -1,0 +1,108 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1649,7 +1649,16 @@
+ 	touch_wr(se, TS4_SPI_RX_LEN, len);
+ 	touch_wr(se, TS4_M_CMD0, 3u << 27); /* SPI_FULL_DUPLEX, CS asserted for the command */
+ 	bool sent = false;
++	uint32_t snap[6][3];
++	unsigned snap_n = 0, snap_at = 1;
+ 	for (t = 0; t < 20000u; ++t) { /* ~100 ms */
++		if (t == snap_at && snap_n < 6u) {
++			snap[snap_n][0] = touch_rd(se, 0x40);
++			snap[snap_n][1] = touch_rd(se, 0x800);
++			snap[snap_n][2] = touch_rd(se, TS4_RX_FIFO_STATUS);
++			++snap_n;
++			snap_at *= 8u;
++		}
+ 		irq = touch_rd(se, TS4_M_IRQ_STATUS);
+ 		if (!sent && (irq & (1u << 30))) {
+ 			for (unsigned i = 0; i < len; i += 4u) {
+@@ -1670,6 +1679,10 @@
+ 	if (!(irq & TS4_M_DONE) || (irq & TS4_M_ERRORS)) {
+ 		printf("SWEET TOUCH4: C: xfer failed irq=%#x status=%#x tx_fifo=%#x rx_fifo=%#x after %u polls (tx_wm_seen=%d)\n",
+ 		    irq, touch_rd(se, 0x40), touch_rd(se, 0x800), touch_rd(se, TS4_RX_FIFO_STATUS), t, sent ? 1 : 0);
++		for (unsigned k = 0; k < snap_n; ++k) {
++			printf("SWEET TOUCH4: C: trace[%u]: status=%#x tx_fifo=%#x rx_fifo=%#x\n",
++			    k, snap[k][0], snap[k][1], snap[k][2]);
++		}
+ 		printf("SWEET TOUCH4: C: dbg: ios=%#x clk_ctrl=%#x cmd0=%#x seq_start=%#x tx_len=%#x rx_len=%#x\n",
+ 		    touch_rd(se, 0x908), touch_rd(se, 0x60), touch_rd(se, TS4_M_CMD0),
+ 		    touch_rd(se, 0x84), touch_rd(se, TS4_SPI_TX_LEN), touch_rd(se, TS4_SPI_RX_LEN));
+@@ -1688,6 +1701,35 @@
+ 	return 0;
+ }
+ 
++/* A command with no data phase (8 = CS assert, 9 = CS deassert). */
++static int
++ts4_spi_simple(vm_offset_t se, unsigned opcode, const char *name)
++{
++	uint32_t irq = 0;
++	unsigned t;
++	if (touch_rd(se, 0x40) & 1u) {
++		ts4_spi_recover(se);
++	}
++	touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
++	touch_wr(se, TS4_M_CMD0, opcode << 27);
++	for (t = 0; t < 20000u; ++t) {
++		irq = touch_rd(se, TS4_M_IRQ_STATUS);
++		if (irq & (TS4_M_DONE | TS4_M_ERRORS)) {
++			break;
++		}
++		delay(5);
++	}
++	printf("SWEET TOUCH4: C: test %s: %s irq=%#x status=%#x ios=%#x polls=%u\n", name,
++	    (irq & TS4_M_DONE) && !(irq & TS4_M_ERRORS) ? "ok" : "FAILED", irq,
++	    touch_rd(se, 0x40), touch_rd(se, 0x908), t);
++	touch_wr(se, TS4_M_IRQ_CLEAR, irq);
++	if (!(irq & TS4_M_DONE) || (irq & TS4_M_ERRORS)) {
++		ts4_spi_recover(se);
++		return EIO;
++	}
++	return 0;
++}
++
+ static uint16_t
+ ts4_crc_kermit(const uint8_t *d, unsigned n)
+ {
+@@ -1748,9 +1790,39 @@
+ ts4_spi_probe(vm_offset_t se)
+ {
+ 	static const uint8_t regs[] = {0xa3, 0x9f, 0xa6, 0xa8};
+-	printf("SWEET TOUCH4: C: SPI probe starting (4.8 MHz, mode 0)\n");
++	int loop = 0;
++	(void)PE_parse_boot_argn("sweettouchspiloop", &loop, sizeof(loop));
++	printf("SWEET TOUCH4: C: SPI probe starting (4.8 MHz, mode 0; expect a3=0x56 9f=0x52)\n");
+ 	ts4_spi_init(se);
++	if (loop) {
++		touch_wr(se, TS4_SPI_LOOPBACK, (touch_rd(se, TS4_SPI_LOOPBACK) & ~3u) | 1u);
++		printf("SWEET TOUCH4: C: internal loopback ON (rx should equal tx)\n");
++	}
+ 	touch_wait(10);
++	/* Staged self-test, simplest first; stop at the first failure. */
++	if (ts4_spi_simple(se, 8u, "CS_ASSERT") != 0 || ts4_spi_simple(se, 9u, "CS_DEASSERT") != 0) {
++		printf("SWEET TOUCH4: C: engine does not run even a data-less command\n");
++		return;
++	}
++	static const uint8_t lens[] = {1, 4, 5, 10};
++	for (unsigned i = 0; i < sizeof(lens); ++i) {
++		uint8_t txb[16], rxb[16];
++		for (unsigned k = 0; k < sizeof(txb); ++k) {
++			txb[k] = (uint8_t)(0xa5u ^ (k * 0x11u));
++		}
++		memset(rxb, 0xee, sizeof(rxb));
++		int rc = ts4_spi_xfer(se, txb, rxb, lens[i]);
++		unsigned same = 0;
++		for (unsigned k = 0; k < lens[i]; ++k) {
++			same += (rxb[k] == txb[k]);
++		}
++		printf("SWEET TOUCH4: C: test FD len=%u: rc=%d rx=%02x %02x %02x %02x %02x same-as-tx=%u/%u\n",
++		    lens[i], rc, rxb[0], rxb[1], rxb[2], rxb[3], rxb[4], same, lens[i]);
++		if (rc != 0) {
++			printf("SWEET TOUCH4: C: stopping at first failed transfer\n");
++			return;
++		}
++	}
+ 	for (unsigned r = 0; r < sizeof(regs); ++r) {
+ 		uint8_t v = 0xee;
+ 		uint8_t raw[16];
