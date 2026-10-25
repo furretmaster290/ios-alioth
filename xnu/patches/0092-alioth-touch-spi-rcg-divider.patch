@@ -1,0 +1,79 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1479,8 +1479,16 @@
+ 		printf("SWEET TOUCH4: B: DFS still on; stopping\n");
+ 		return 0;
+ 	}
+-	/* XO parent 0, HID divider 1 => 19.2 MHz. */
+-	cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++	/* XO parent 0.  HID divider field 1 => /1 (19.2 MHz); field 2*n-1 => /n
++	 * (7 => 4.8 MHz).  Dividing here leaves the engine's own divider alone. */
++	unsigned rcgdiv = 1;
++	(void)PE_parse_boot_argn("sweettouchrcgdiv", &rcgdiv, sizeof(rcgdiv));
++	rcgdiv &= 0x1fu;
++	if (rcgdiv == 0) {
++		rcgdiv = 1;
++	}
++	printf("SWEET TOUCH4: B: RCG HID divider field=%u => %u kHz\n", rcgdiv, 19200u * 2u / (rcgdiv + 1u));
++	cfg = (cfg & ~(0x371fu | (1u << 20))) | rcgdiv;
+ 	touch_wr(gcc, TS4_RCG + 4u, cfg);
+ 	touch_wr(gcc, TS4_RCG, touch_rd(gcc, TS4_RCG) | 1u);
+ 	if (!touch_wait_clear(gcc, TS4_RCG, 1u)) {
+@@ -1822,6 +1830,32 @@
+ 	return ret;
+ }
+ 
++static bool ts4_wait_idle_fwd(vm_offset_t se, unsigned polls);
++
++/* Try several engine divider values; restore the firmware's /1 after any stall. */
++static void
++ts4_div_sweep(vm_offset_t se)
++{
++	static const unsigned divs[] = {2, 3, 4, 5, 6, 8};
++	for (unsigned i = 0; i < sizeof(divs) / sizeof(divs[0]); ++i) {
++		touch_wr(se, TS4_GENI_SER_M_CLK_CFG, (divs[i] << 4) | 1u);
++		touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
++		touch_wr(se, TS4_M_CMD0, 8u << 27);
++		bool ok = ts4_wait_idle_fwd(se, 2000);
++		printf("SWEET TOUCH4: C: sweep engine div=%u: %s status=%#x\n", divs[i], ok ? "ok" : "STUCK", touch_rd(se, 0x40));
++		if (!ok) {
++			touch_wr(se, TS4_GENI_SER_M_CLK_CFG, 0x11u);
++			bool rec = ts4_wait_idle_fwd(se, 4000);
++			printf("SWEET TOUCH4: C: sweep restore div=1 -> %s status=%#x\n", rec ? "RECOVERED" : "still stuck", touch_rd(se, 0x40));
++			if (!rec) {
++				return;
++			}
++		}
++		touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
++	}
++	touch_wr(se, TS4_GENI_SER_M_CLK_CFG, 0x11u);
++}
++
+ /* Dump the interesting parts of the SE4 register file, 4 words per line. */
+ static void
+ ts4_dump(vm_offset_t se, const char *tag)
+@@ -1852,6 +1886,12 @@
+ 	return false;
+ }
+ 
++static bool
++ts4_wait_idle_fwd(vm_offset_t se, unsigned polls)
++{
++	return ts4_wait_idle(se, polls);
++}
++
+ static void
+ ts4_spi_probe(vm_offset_t se)
+ {
+@@ -1886,6 +1926,10 @@
+ 				{TS4_G_CLK, "serial clock div 4"}, {TS4_G_MIRQ, "M_IRQ_EN mask"},
+ 			};
+ 			for (unsigned i = 0; i < sizeof(steps) / sizeof(steps[0]); ++i) {
++				if (ladder == 2 && steps[i].g == TS4_G_CLK) {
++					ts4_div_sweep(se);
++					continue;
++				}
+ 				ts4_g_apply(se, steps[i].g);
+ 				touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
+ 				touch_wr(se, TS4_M_CMD0, 8u << 27);
