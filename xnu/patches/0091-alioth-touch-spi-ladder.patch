@@ -1,0 +1,140 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1559,44 +1559,79 @@
+ #define TS4_SPI_DIV            4u /* 19.2 MHz / 4 = 4.8 MHz, mode 0, 8-bit */
+ #define TS4_FTS_MAX_DATA       16u
+ 
++/* Groups of init writes that change the firmware's state; sweettouchspiskip bitmask. */
++#define TS4_G_IRQ    1u   /* SE_IRQ_EN/S_IRQ_EN := 0 */
++#define TS4_G_FORCE  2u   /* GENI_FORCE_DEFAULT := 1 */
++#define TS4_G_PACK   4u   /* TX/RX packing + byte granularity */
++#define TS4_G_WLEN   8u   /* SPI word length */
++#define TS4_G_CLK    16u  /* serial clock divider */
++#define TS4_G_MIRQ   32u  /* master IRQ enable mask */
++static unsigned ts4_skip;
++
++static void
++ts4_g_apply(vm_offset_t se, unsigned group)
++{
++	switch (group) {
++	case TS4_G_IRQ:
++		touch_wr(se, TS4_SE_IRQ_EN, 0u); /* like the I2C engine */
++		touch_wr(se, 0x644u, 0u);        /* S_IRQ_EN */
++		break;
++	case TS4_G_FORCE:
++		touch_wr(se, TS4_GENI_FORCE_DEFAULT, 1u);
++		break;
++	case TS4_G_PACK:
++		/* 4 x 8-bit words per FIFO entry, MSB first */
++		touch_wr(se, TS4_GENI_TX_PACK0, 0x0007f8feu);
++		touch_wr(se, TS4_GENI_TX_PACK1, 0x000ffefeu);
++		touch_wr(se, TS4_GENI_RX_PACK0, 0x0007f8feu);
++		touch_wr(se, TS4_GENI_RX_PACK1, 0x000ffefeu);
++		touch_wr(se, TS4_GENI_BYTE_GRAN, 0u);
++		break;
++	case TS4_G_WLEN:
++		touch_wr(se, TS4_SPI_WORD_LEN, (touch_rd(se, TS4_SPI_WORD_LEN) & ~0x3ffu) | (8u - 4u));
++		break;
++	case TS4_G_CLK:
++		touch_wr(se, TS4_GENI_CLK_SEL, 0u);
++		touch_wr(se, TS4_GENI_SER_M_CLK_CFG, (TS4_SPI_DIV << 4) | 1u);
++		break;
++	case TS4_G_MIRQ:
++		touch_wr(se, TS4_M_IRQ_EN, TS4_M_DONE | TS4_M_ERRORS | (1u << 26) | (1u << 27) | (1u << 30));
++		break;
++	default:
++		break;
++	}
++}
++
+ static void
+ ts4_spi_init(vm_offset_t se)
+ {
++	/* These all match what the firmware already left in the engine. */
+ 	touch_wr(se, TS4_GENI_CGC_CTRL, touch_rd(se, TS4_GENI_CGC_CTRL) | 0x7fu);
+ 	touch_wr(se, TS4_DMA_GENERAL_CFG, touch_rd(se, TS4_DMA_GENERAL_CFG) | 0xfu);
+ 	touch_wr(se, TS4_GENI_OUTPUT_CTRL, 0x7fu);
+-	touch_wr(se, TS4_GENI_FORCE_DEFAULT, 1u);
+-	touch_wr(se, TS4_SE_IRQ_EN, 0u); /* like the I2C engine: poll local M_IRQ_STATUS */
+-	touch_wr(se, 0x644u, 0u);        /* S_IRQ_EN */
+ 	touch_wr(se, TS4_GENI_DMA_MODE_EN, touch_rd(se, TS4_GENI_DMA_MODE_EN) & ~1u);
+ 	touch_wr(se, TS4_GSI_EVENT_EN, 0u);
+ 	touch_wr(se, TS4_RX_WATERMARK, 0u);
+-	/* Linux: geni_se_init(base, 0, tx_fifo_depth - 2); 0 here stalls full-duplex */
+ 	touch_wr(se, TS4_RX_RFR_WATERMARK, 14u);
+ 	touch_wr(se, TS4_TX_WATERMARK, 0u);
+-	/* 4 x 8-bit words per FIFO entry, MSB first */
+-	touch_wr(se, TS4_GENI_TX_PACK0, 0x0007f8feu);
+-	touch_wr(se, TS4_GENI_TX_PACK1, 0x000ffefeu);
+-	touch_wr(se, TS4_GENI_RX_PACK0, 0x0007f8feu);
+-	touch_wr(se, TS4_GENI_RX_PACK1, 0x000ffefeu);
+-	touch_wr(se, TS4_GENI_BYTE_GRAN, 0u);
+-	touch_wr(se, TS4_SPI_WORD_LEN, (touch_rd(se, TS4_SPI_WORD_LEN) & ~0x3ffu) | (8u - 4u));
+-	/* SPI mode 0, chip select 0, no loopback, no inter-word delays */
++	/* SPI mode 0, chip select 0, no loopback, no inter-word delays (all zero already) */
+ 	touch_wr(se, TS4_SPI_LOOPBACK, touch_rd(se, TS4_SPI_LOOPBACK) & ~3u);
+ 	touch_wr(se, TS4_SPI_DEMUX_SEL, 0u);
+ 	touch_wr(se, TS4_SPI_CPHA, touch_rd(se, TS4_SPI_CPHA) & ~1u);
+ 	touch_wr(se, TS4_SPI_CPOL, touch_rd(se, TS4_SPI_CPOL) & ~4u);
+ 	touch_wr(se, TS4_SPI_DEMUX_INV, 0u);
+ 	touch_wr(se, TS4_SPI_DELAYS, 0u);
+-	touch_wr(se, TS4_GENI_CLK_SEL, 0u);
+-	touch_wr(se, TS4_GENI_SER_M_CLK_CFG, (TS4_SPI_DIV << 4) | 1u);
+-	touch_wr(se, TS4_M_IRQ_EN, TS4_M_DONE | TS4_M_ERRORS | (1u << 26) | (1u << 27) | (1u << 30));
+-	printf("SWEET TOUCH4: C: SPI init: rx_wm=%#x rfr_wm=%#x status=%#x\n",
+-	    touch_rd(se, TS4_RX_WATERMARK), touch_rd(se, TS4_RX_RFR_WATERMARK), touch_rd(se, 0x40));
+-	printf("SWEET TOUCH4: C: SPI init: word_len=%#x cfg=%#x clk=%#x tx_pack=%#x/%#x\n",
+-	    touch_rd(se, TS4_SPI_WORD_LEN), touch_rd(se, TS4_SPI_TRANS_CFG),
+-	    touch_rd(se, TS4_GENI_SER_M_CLK_CFG), touch_rd(se, TS4_GENI_TX_PACK0),
+-	    touch_rd(se, TS4_GENI_TX_PACK1));
++	/* The writes that actually change the firmware's state, skippable per group. */
++	for (unsigned g = TS4_G_IRQ; g <= TS4_G_MIRQ; g <<= 1) {
++		if (!(ts4_skip & g)) {
++			ts4_g_apply(se, g);
++		}
++	}
++	printf("SWEET TOUCH4: C: SPI init (skip mask %#x): rx_wm=%#x rfr_wm=%#x status=%#x\n",
++	    ts4_skip, touch_rd(se, TS4_RX_WATERMARK), touch_rd(se, TS4_RX_RFR_WATERMARK), touch_rd(se, 0x40));
++	printf("SWEET TOUCH4: C: SPI init: word_len=%#x clk=%#x tx_pack=%#x/%#x irq_en=%#x\n",
++	    touch_rd(se, TS4_SPI_WORD_LEN), touch_rd(se, TS4_GENI_SER_M_CLK_CFG),
++	    touch_rd(se, TS4_GENI_TX_PACK0), touch_rd(se, TS4_GENI_TX_PACK1), touch_rd(se, TS4_SE_IRQ_EN));
+ }
+ 
+ static void
+@@ -1841,8 +1876,34 @@
+ 			return;
+ 		}
+ 		touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
+-		printf("SWEET TOUCH4: C: raw command worked; now applying the SPI init and continuing\n");
++		printf("SWEET TOUCH4: C: raw command worked\n");
++		int ladder = 1;
++		(void)PE_parse_boot_argn("sweettouchspiladder", &ladder, sizeof(ladder));
++		if (ladder) {
++			static const struct { unsigned g; const char *name; } steps[] = {
++				{TS4_G_IRQ, "SE_IRQ_EN=0"}, {TS4_G_FORCE, "FORCE_DEFAULT=1"},
++				{TS4_G_PACK, "packing cfg0=0x7f8fe"}, {TS4_G_WLEN, "SPI word length=8"},
++				{TS4_G_CLK, "serial clock div 4"}, {TS4_G_MIRQ, "M_IRQ_EN mask"},
++			};
++			for (unsigned i = 0; i < sizeof(steps) / sizeof(steps[0]); ++i) {
++				ts4_g_apply(se, steps[i].g);
++				touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
++				touch_wr(se, TS4_M_CMD0, 8u << 27);
++				bool ok2 = ts4_wait_idle(se, 2000);
++				printf("SWEET TOUCH4: C: ladder step %u [%s]: CS_ASSERT %s status=%#x irq=%#x\n",
++				    i + 1, steps[i].name, ok2 ? "ok" : "STUCK", touch_rd(se, 0x40), touch_rd(se, TS4_M_IRQ_STATUS));
++				if (!ok2) {
++					printf("SWEET TOUCH4: C: CULPRIT = group %#x (%s); rerun with sweettouchspiskip=%u\n",
++					    steps[i].g, steps[i].name, steps[i].g);
++					ts4_dump(se, "ladder-stuck");
++					return;
++				}
++				touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
++			}
++			printf("SWEET TOUCH4: C: ladder complete: all six writes are safe one by one\n");
++		}
+ 	}
++	(void)PE_parse_boot_argn("sweettouchspiskip", &ts4_skip, sizeof(ts4_skip));
+ 	ts4_spi_init(se);
+ 	if (loop) {
+ 		touch_wr(se, TS4_SPI_LOOPBACK, (touch_rd(se, TS4_SPI_LOOPBACK) & ~3u) | 1u);
