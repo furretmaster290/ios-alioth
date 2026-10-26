@@ -1,0 +1,241 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1442,6 +1442,7 @@
+ #define TS4_GCC_VOTE      0x52008u
+ /* wrap0: m_ahb(6) s_ahb(7) core(8) core_2x(9) s4(14) */
+ #define TS4_GCC_MASK      ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 14))
++static int ts4_mode = 2; /* sweettouch=2 diagnostics, sweettouch=3 touch driver */
+ 
+ static void
+ ts4_gpio(vm_offset_t base, unsigned pin, unsigned mux, unsigned pull,
+@@ -1481,7 +1482,7 @@
+ 	}
+ 	/* XO parent 0.  HID divider field 1 => /1 (19.2 MHz); field 2*n-1 => /n
+ 	 * (7 => 4.8 MHz).  Dividing here leaves the engine's own divider alone. */
+-	unsigned rcgdiv = 1;
++	unsigned rcgdiv = (ts4_mode == 3) ? 7u : 1u;
+ 	(void)PE_parse_boot_argn("sweettouchrcgdiv", &rcgdiv, sizeof(rcgdiv));
+ 	rcgdiv &= 0x1fu;
+ 	if (rcgdiv == 0) {
+@@ -1565,7 +1566,7 @@
+ #define TS4_M_DONE             (1u << 0)
+ #define TS4_M_ERRORS           (0x3eu | (1u << 24) | (1u << 25) | (1u << 28) | (1u << 29))
+ #define TS4_SPI_DIV            4u /* 19.2 MHz / 4 = 4.8 MHz, mode 0, 8-bit */
+-#define TS4_FTS_MAX_DATA       16u
++#define TS4_FTS_MAX_DATA       48u
+ 
+ /* Groups of init writes that change the firmware's state; sweettouchspiskip bitmask. */
+ #define TS4_G_IRQ    1u   /* SE_IRQ_EN/S_IRQ_EN := 0 */
+@@ -1892,12 +1893,13 @@
+ 	return ts4_wait_idle(se, polls);
+ }
+ 
+-static void
++static bool
+ ts4_spi_probe(vm_offset_t se)
+ {
+ 	static const uint8_t regs[] = {0xa3, 0x9f, 0xa6, 0xa8};
+ 	int loop = 0;
+ 	int raw = 1; /* default: untouched engine + QUP0 vote before the first command */
++	ts4_skip = (ts4_mode == 3) ? TS4_G_CLK : 0u; /* mode 3: the RCG provides the clock */
+ 	(void)PE_parse_boot_argn("sweettouchspiloop", &loop, sizeof(loop));
+ 	(void)PE_parse_boot_argn("sweettouchspiraw", &raw, sizeof(raw));
+ 	printf("SWEET TOUCH4: C: SPI probe starting (4.8 MHz, mode 0; expect a3=0x56 9f=0x52), raw=%d\n", raw);
+@@ -1913,11 +1915,11 @@
+ 		    ok ? "COMPLETED" : "STUCK", touch_rd(se, 0x40), touch_rd(se, TS4_M_IRQ_STATUS));
+ 		ts4_dump(se, ok ? "post-ok" : "post-stuck");
+ 		if (!ok) {
+-			return;
++			return false;
+ 		}
+ 		touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
+ 		printf("SWEET TOUCH4: C: raw command worked\n");
+-		int ladder = 1;
++		int ladder = (ts4_mode == 3) ? 0 : 1;
+ 		(void)PE_parse_boot_argn("sweettouchspiladder", &ladder, sizeof(ladder));
+ 		if (ladder) {
+ 			static const struct { unsigned g; const char *name; } steps[] = {
+@@ -1940,7 +1942,7 @@
+ 					printf("SWEET TOUCH4: C: CULPRIT = group %#x (%s); rerun with sweettouchspiskip=%u\n",
+ 					    steps[i].g, steps[i].name, steps[i].g);
+ 					ts4_dump(se, "ladder-stuck");
+-					return;
++					return false;
+ 				}
+ 				touch_wr(se, TS4_M_IRQ_CLEAR, 0xffffffffu);
+ 			}
+@@ -1986,7 +1988,7 @@
+ 		}
+ 		if (touch_rd(se, 0x40) & 1u) {
+ 			printf("SWEET TOUCH4: C: no remedy worked; status=%#x\n", touch_rd(se, 0x40));
+-			return;
++			return false;
+ 		}
+ 	} else {
+ 		printf("SWEET TOUCH4: C: first command completed without remedies\n");
+@@ -1995,7 +1997,7 @@
+ 	/* Staged self-test, simplest first; stop at the first failure. */
+ 	if (ts4_spi_simple(se, 8u, "CS_ASSERT") != 0 || ts4_spi_simple(se, 9u, "CS_DEASSERT") != 0) {
+ 		printf("SWEET TOUCH4: C: engine does not run even a data-less command\n");
+-		return;
++		return false;
+ 	}
+ 	static const uint8_t lens[] = {1, 4, 5, 10};
+ 	for (unsigned i = 0; i < sizeof(lens); ++i) {
+@@ -2013,18 +2015,115 @@
+ 		    lens[i], rc, rxb[0], rxb[1], rxb[2], rxb[3], rxb[4], same, lens[i]);
+ 		if (rc != 0) {
+ 			printf("SWEET TOUCH4: C: stopping at first failed transfer\n");
+-			return;
++			return false;
+ 		}
+ 	}
++	uint8_t idh = 0, idl = 0;
+ 	for (unsigned r = 0; r < sizeof(regs); ++r) {
+ 		uint8_t v = 0xee;
+ 		uint8_t raw[16];
+ 		memset(raw, 0xee, sizeof(raw));
+ 		int rc = ts4_fts_read(se, regs[r], &v, 1, raw);
++		if (rc == 0 && regs[r] == 0xa3) {
++			idh = v;
++		} else if (rc == 0 && regs[r] == 0x9f) {
++			idl = v;
++		}
+ 		printf("SWEET TOUCH4: C: reg %#x -> rc=%d val=%#x raw=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 		    regs[r], rc, v, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9]);
+ 	}
+-	printf("SWEET TOUCH4: C: SPI probe done\n");
++	printf("SWEET TOUCH4: C: SPI probe done (chip id %02x%02x)\n", idh, idl);
++	return idh == 0x56 && idl == 0x52;
++}
++
++/*
++ * Touch driver for POCO F3 (sweettouch=3).  Reads register 0x01 (FocalTech
++ * point report) every 8 ms and feeds sweet_hid_touch(); coordinates are the
++ * chip's 15-bit values divided by 8, which is the 1080x2400 pixel space the
++ * HID layer expects.  Report layout per the vendor focaltech_spi driver
++ * (data[] below is buf[1..], i.e. the bytes after the read command):
++ *   data[1] = point count (low nibble), then 6 bytes per point from data[2]:
++ *   +0 event(7:6) | xh(3:0), +1 xl, +2 id(7:4) | yh(3:0), +3 yl, +4 pressure/lsbs, +5 area
++ */
++#define TS4_MAXF 5u
++
++static void
++ts4_touch_loop(vm_offset_t se, vm_offset_t south)
++{
++	uint8_t data[32];
++	uint8_t raw[16];
++	uint32_t active = 0;
++	int lx[TS4_MAXF] = {0}, ly[TS4_MAXF] = {0};
++	unsigned reports = 0, errors = 0, consecutive_err = 0, logged = 0;
++	printf("SWEET TOUCH4: T: touch loop running (poll 8 ms, coords /8, %u fingers)\n", TS4_MAXF);
++	for (;;) {
++		touch_wait(8);
++		memset(data, 0, sizeof(data));
++		int rc = ts4_fts_read(se, 0x01, data, sizeof(data), raw);
++		if (rc != 0) {
++			++errors;
++			++consecutive_err;
++			if (errors <= 8 || (errors % 500) == 0) {
++				printf("SWEET TOUCH4: T: read error rc=%d (errors=%u)\n", rc, errors);
++			}
++			continue;
++		}
++		consecutive_err = 0;
++		unsigned npoints = data[1] & 0x0fu;
++		bool recovery = (npoints == 0x0fu) && data[2] == 0xff && data[3] == 0xff &&
++		    data[4] == 0xff && data[5] == 0xff && data[6] == 0xff;
++		uint32_t mask = 0;
++		int nx[TS4_MAXF] = {0}, ny[TS4_MAXF] = {0};
++		if (!recovery && npoints > 0 && npoints <= 10u) {
++			for (unsigned i = 0; i < TS4_MAXF; ++i) {
++				unsigned base = 6u * i;
++				unsigned id = data[4 + base] >> 4;
++				if (id >= 0x0au) {
++					break; /* empty slot */
++				}
++				if (id >= TS4_MAXF) {
++					continue;
++				}
++				unsigned flag = data[2 + base] >> 6; /* 0 down, 1 up, 2 contact */
++				unsigned xr = ((data[2 + base] & 0x0fu) << 11) + ((unsigned)data[3 + base] << 3) +
++				    ((data[6 + base] & 0xe0u) >> 5);
++				unsigned yr = ((data[4 + base] & 0x0fu) << 11) + ((unsigned)data[5 + base] << 3) +
++				    ((data[6 + base] & 0x1cu) >> 2);
++				if (flag == 1u) {
++					continue; /* lift-off: not in the mask, released below */
++				}
++				mask |= 1u << id;
++				nx[id] = (int)(xr / 8u);
++				ny[id] = (int)(yr / 8u);
++			}
++		}
++		++reports;
++		if (mask != 0 || active != 0) {
++			if (logged < 40) {
++				++logged;
++				printf("SWEET TOUCH4: T: report n=%u mask=%#x active=%#x f0=(%d,%d) irq=%u raw=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++				    npoints, mask, active, nx[0], ny[0],
++				    (unsigned)(touch_rd(south, TS4_GPIO_IRQ * 0x1000u + 4u) & 1u),
++				    raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
++			}
++		}
++		for (unsigned id = 0; id < TS4_MAXF; ++id) {
++			uint32_t bit = 1u << id;
++			if (mask & bit) {
++				if (!(active & bit) || nx[id] != lx[id] || ny[id] != ly[id]) {
++					sweet_hid_touch((int)id, 1, nx[id], ny[id]);
++				}
++				lx[id] = nx[id];
++				ly[id] = ny[id];
++			} else if (active & bit) {
++				sweet_hid_touch((int)id, 0, lx[id], ly[id]);
++			}
++		}
++		active = mask;
++		if (consecutive_err == 0 && (reports % 8000u) == 0) {
++			printf("SWEET TOUCH4: T: alive: %u reports, %u read errors\n", reports, errors);
++		}
++	}
+ }
+ 
+ static void
+@@ -2035,9 +2134,13 @@
+ 	int spi_probe = 0;
+ 	(void)arg;
+ 	(void)result;
++	(void)PE_parse_boot_argn("sweettouch", &ts4_mode, sizeof(ts4_mode));
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("sweettouchse", &phase_b, sizeof(phase_b));
+ 	(void)PE_parse_boot_argn("sweettouchspi", &spi_probe, sizeof(spi_probe));
++	if (ts4_mode == 3) {
++		spi_probe = 1; /* the driver needs the full bring-up */
++	}
+ 	if (spi_probe) {
+ 		phase_b = 1;
+ 	}
+@@ -2099,7 +2202,13 @@
+ 		if (gcc) {
+ 			vm_offset_t se4 = ts4_phase_b(gcc);
+ 			if (se4 && spi_probe) {
+-				ts4_spi_probe(se4);
++				bool chip_ok = ts4_spi_probe(se4);
++				if (ts4_mode == 3) {
++					if (chip_ok) {
++						ts4_touch_loop(se4, south); /* never returns */
++					}
++					printf("SWEET TOUCH4: T: chip id check failed; not starting the touch loop\n");
++				}
+ 			} else if (spi_probe) {
+ 				printf("SWEET TOUCH4: C: skipped (SE4 clocks not ready)\n");
+ 			}
+@@ -2132,7 +2241,7 @@
+ 		return;
+ 	}
+ #if defined(UMI)
+-	if (enabled == 2) {
++	if (enabled == 2 || enabled == 3) {
+ 		kern_return_t kr2 = kernel_thread_start(touch_spi_thread, NULL, &thread);
+ 		if (kr2 == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
