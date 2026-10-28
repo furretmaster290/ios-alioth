@@ -1,0 +1,42 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -41,6 +41,7 @@
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/system.h>
++#include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
+ #include <mach/vm_param.h>
+@@ -492,6 +493,30 @@
+ 	request->height = s->height;
+ 	request->pixelFormat = s->pixelFormat;
+ 	request->planes = s->planeCount;
++	/*
++	 * CoreAnimation's frame surfaces are 'b3a8' (Apple's compressed 32-bit kind) with two planes
++	 * (13893632 bytes for 1125 x 2436: 4544 bytes a row for 2436 rows, then 2824448 more). Nothing
++	 * here compresses: plane 0 holds ordinary blue-first pixels, which is what the display shows.
++	 * Mesa's import of an IOSurface (osmesa_surface_resource) takes only 'BGRA' without planes, so
++	 * with the surface described as it is every frame is read back by this processor (~115 ms of
++	 * ~126 ms a frame, measured); described as what plane 0 holds, the GPU draws into it in place.
++	 * boot-arg sweetgpuplane0=0 describes it as it is again.
++	 */
++	{
++		static int plane0 = -1;
++
++		if (plane0 < 0) {
++			uint32_t on = 1;
++
++			(void)PE_parse_boot_argn("sweetgpuplane0", &on, sizeof(on));
++			plane0 = on != 0;
++		}
++		if (plane0 && s->pixelFormat == 0x62336138u /* 'b3a8' */ && s->planeCount >= 1 &&
++		    (uint64_t)s->bytesPerRow * s->height <= size) {
++			request->pixelFormat = 0x42475241u;     /* 'BGRA' */
++			request->planes = 0;
++		}
++	}
+ 	if (request->handle == SURFACE_DESCRIBE) {
+ 		request->handle = 0;
+ 		s->release();
